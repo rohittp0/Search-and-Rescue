@@ -1,0 +1,4 @@
+# One YouTube search query per line. Blank lines and # comments are ignored.
+python tutorial
+rust tutorial
+old school game development
