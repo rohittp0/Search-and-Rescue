@@ -29,12 +29,11 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Sequence
 
 import requests
 import tldextract
 from youtubesearchpython import VideosSearch
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -45,6 +44,9 @@ RDAP_URL = "https://rdap.org/domain/{}"
 RDAP_TIMEOUT = 10
 RDAP_RETRY_SLEEP = 2.0
 FLUSH_EVERY_N_AVAILABLE = 100
+
+WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
+WAYBACK_TIMEOUT = 15
 
 CSV_COLUMNS = [
     "video_id",
@@ -57,6 +59,9 @@ CSV_COLUMNS = [
     "registrar",
     "buy_url",
     "checked_at",
+    "wb_snapshots",
+    "wb_first_seen",
+    "wb_last_seen",
 ]
 
 # Domains that will never be "expired" and would just create noise.
@@ -169,12 +174,14 @@ class Cache:
         self.queries_path = self.dir / "queries.json"
         self.videos_path = self.dir / "videos.json"
         self.domains_path = self.dir / "domains.json"
+        self.wayback_path = self.dir / "wayback.json"
         self.rows_path = self.dir / "rows.json"
 
         self.lock = threading.RLock()
         self.queries: dict[str, dict] = _load_json(self.queries_path, {})
         self.videos: dict[str, dict] = _load_json(self.videos_path, {})
         self.domains: dict[str, dict] = _load_json(self.domains_path, {})
+        self.wayback: dict[str, dict] = _load_json(self.wayback_path, {})
         self.rows: dict[str, dict] = _load_json(self.rows_path, {})
 
         self._dirty = False
@@ -183,7 +190,15 @@ class Cache:
     def has_query(self, query: str, max_results: int) -> bool:
         with self.lock:
             entry = self.queries.get(normalize_query(query))
-            return bool(entry) and entry.get("max_results", 0) >= max_results
+            if entry is None:
+                return False
+
+            max_results_entry = entry.get("max_results", 0)
+
+            if not isinstance(max_results_entry, int):
+                raise ValueError(f"Invalid max_results in cache for query {query!r}: {max_results_entry!r}")
+
+            return  max_results_entry >= max_results
 
     def get_cached_video_ids(self, query: str) -> list[str]:
         with self.lock:
@@ -224,6 +239,17 @@ class Cache:
             self.domains[domain] = data
             self._dirty = True
 
+    # -- wayback ------------------------------------------------------------
+    def get_wayback(self, domain: str) -> dict | None:
+        with self.lock:
+            entry = self.wayback.get(domain)
+            return dict(entry) if entry else None
+
+    def add_wayback(self, domain: str, data: dict) -> None:
+        with self.lock:
+            self.wayback[domain] = data
+            self._dirty = True
+
     # -- rows ---------------------------------------------------------------
     def upsert_row(self, video_id: str, domain: str, row: dict) -> None:
         with self.lock:
@@ -246,6 +272,7 @@ class Cache:
             _atomic_write_json(self.queries_path, self.queries)
             _atomic_write_json(self.videos_path, self.videos)
             _atomic_write_json(self.domains_path, self.domains)
+            _atomic_write_json(self.wayback_path, self.wayback)
             _atomic_write_json(self.rows_path, self.rows)
             self._dirty = False
 
@@ -324,6 +351,10 @@ def search_videos(query: str, max_results: int, cache: Cache) -> list[dict]:
     try:
         search = VideosSearch(query, limit=max_results)
         payload = search.result()
+        if isinstance(payload, str):
+            logging.warning("Unexpected string payload from YouTube search for %r: %s", query, payload)
+            return []
+
     except Exception as exc:  # noqa: BLE001
         logging.warning("YouTube search failed for %r: %s", query, exc)
         return []
@@ -360,7 +391,7 @@ def search_videos(query: str, max_results: int, cache: Cache) -> list[dict]:
 
 
 _URL_RE = re.compile(
-    r"https?://[^\s<>\"'\)\]\}]+|(?<![\w@])www\.[\w.-]+\.[a-z]{2,}(?:/[^\s<>\"'\)\]\}]*)?",
+    r"https?://[^\s<>\"')\]}]+|(?<![\w@])www\.[\w.-]+\.[a-z]{2,}(?:/[^\s<>\"')\]}]*)?",
     re.IGNORECASE,
 )
 
@@ -439,6 +470,42 @@ def check_domain(domain: str, session: requests.Session) -> dict:
     }
 
 
+def check_wayback(domain: str, session: requests.Session) -> dict:
+    """Query Wayback Machine CDX API for domain archive history.
+
+    Uses one request with monthly collapse to get first_seen, last_seen,
+    and a snapshot count (number of months the site was actively archived).
+    """
+    result: dict = {"wb_snapshots": 0, "wb_first_seen": "", "wb_last_seen": ""}
+    params = {
+        "url": domain,
+        "output": "json",
+        "fl": "timestamp",
+        "filter": "statuscode:200",
+        "collapse": "timestamp:6",  # one entry per calendar month
+        "limit": 600,
+    }
+    try:
+        resp = session.get(WAYBACK_CDX_URL, params=params, timeout=WAYBACK_TIMEOUT)
+        if resp.status_code != 200:
+            return result
+        rows = resp.json()
+        # CDX returns [["timestamp"], ["20120301..."], ...]; first row is the header
+        data = rows[1:] if rows and rows[0] == ["timestamp"] else rows
+        if not data:
+            return result
+
+        def _fmt(ts: str) -> str:
+            return f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
+
+        result["wb_snapshots"] = len(data)
+        result["wb_first_seen"] = _fmt(data[0][0])
+        result["wb_last_seen"] = _fmt(data[-1][0])
+    except Exception as exc:
+        logging.debug("Wayback check failed for %s: %s", domain, exc)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Run state + orchestration
 # ---------------------------------------------------------------------------
@@ -500,6 +567,14 @@ def resolve_domain(
         else:
             logging.debug("[cache] domain %s -> %s", domain, record.get("status"))
 
+        wb = cache.get_wayback(domain)
+        if wb is None:
+            wb = check_wayback(domain, _session())
+            cache.add_wayback(domain, wb)
+            logging.info("[net]   wayback %s -> %d months", domain, wb.get("wb_snapshots", 0))
+        else:
+            logging.debug("[cache] wayback %s -> %d months", domain, wb.get("wb_snapshots", 0))
+
         row = {
             "video_id": video["id"],
             "video_url": video["url"],
@@ -511,6 +586,9 @@ def resolve_domain(
             "registrar": record.get("registrar") or "",
             "buy_url": record.get("buy_url") or "",
             "checked_at": record.get("checked_at", ""),
+            "wb_snapshots": wb.get("wb_snapshots", 0),
+            "wb_first_seen": wb.get("wb_first_seen", ""),
+            "wb_last_seen": wb.get("wb_last_seen", ""),
         }
         cache.upsert_row(video["id"], domain, row)
         if row["status"] == "available":
@@ -597,7 +675,7 @@ def read_queries(path: Path) -> list[str]:
     return list(dict.fromkeys(lines))
 
 
-def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Scrape YouTube descriptions, report expired domains to CSV."
     )
@@ -620,7 +698,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
