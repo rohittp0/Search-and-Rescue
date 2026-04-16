@@ -211,3 +211,5 @@ cache/*.json
 report.csv
 
 .idea/
+queries.txt
+.gitnexus
