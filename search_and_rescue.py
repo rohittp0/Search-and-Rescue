@@ -255,7 +255,9 @@ class Cache:
 # ---------------------------------------------------------------------------
 
 
-_VIEW_RE = re.compile(r"[\d,]+")
+_VIEW_RE = re.compile(r"([\d,]+(?:\.\d+)?)([KkMmBbTt])?")
+
+_VIEW_SUFFIX = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000, "t": 1_000_000_000_000}
 
 
 def _parse_views(raw: Any) -> int:
@@ -273,7 +275,9 @@ def _parse_views(raw: Any) -> int:
     if not m:
         return 0
     try:
-        return int(m.group(0).replace(",", ""))
+        value = float(m.group(1).replace(",", ""))
+        multiplier = _VIEW_SUFFIX.get((m.group(2) or "").lower(), 1)
+        return int(value * multiplier)
     except ValueError:
         return 0
 
@@ -471,19 +475,24 @@ class RunState:
             self._flush_locked()
 
 
+_tls = threading.local()
+
+
 def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
+    if not hasattr(_tls, "session"):
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT})
+        _tls.session = s
+    return _tls.session
 
 
 def resolve_domain(
-    video: dict, domain: str, cache: Cache, state: RunState, session: requests.Session
+    video: dict, domain: str, cache: Cache, state: RunState
 ) -> None:
     try:
         record = cache.get_domain(domain)
         if record is None:
-            record = check_domain(domain, session)
+            record = check_domain(domain, _session())
             cache.add_domain(domain, record)
             logging.info(
                 "[net]   rdap %s -> %s", domain, record.get("status")
@@ -515,7 +524,6 @@ def process_video(
     cache: Cache,
     state: RunState,
     pool: ThreadPoolExecutor,
-    session: requests.Session,
 ) -> None:
     cached = cache.get_video(video["id"])
     if cached and "domains" in cached:
@@ -540,7 +548,7 @@ def process_video(
         )
 
     for domain in domains:
-        fut = pool.submit(resolve_domain, video, domain, cache, state, session)
+        fut = pool.submit(resolve_domain, video, domain, cache, state)
         with state.lock:
             state.domain_futures.append(fut)
 
@@ -630,7 +638,6 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     cache = Cache(args.cache_dir)
     state = RunState(cache, args.output, flush_every=max(1, args.flush_every))
-    session = _session()
 
     logging.info(
         "Starting run: %d queries, min_views=%d, max_per_query=%d, workers=%d",
@@ -650,7 +657,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     if int(video.get("views") or 0) < args.min_views:
                         continue
                     video_futures.append(
-                        pool.submit(process_video, video, cache, state, pool, session)
+                        pool.submit(process_video, video, cache, state, pool)
                     )
 
             wait(video_futures)
