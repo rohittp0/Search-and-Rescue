@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search and Rescue — Expired Domain Report</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --surface: #181b22;
+    --border: #262a33;
+    --fg: #e6e8ec;
+    --muted: #8b93a4;
+    --accent: #6ee7b7;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --link: #93c5fd;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa;
+      --surface: #ffffff;
+      --border: #e4e7eb;
+      --fg: #1a1d24;
+      --muted: #5b6472;
+      --accent: #047857;
+      --warn: #b45309;
+      --bad: #b91c1c;
+      --link: #1d4ed8;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+               font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI",
+                     Roboto, Helvetica, Arial, sans-serif; }
+  header { padding: 20px 24px 12px; border-bottom: 1px solid var(--border);
+           background: var(--surface); position: sticky; top: 0; z-index: 2; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+              margin-top: 12px; }
+  .controls input[type="text"] {
+    flex: 1 1 280px; min-width: 0; padding: 8px 10px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+    border-radius: 6px; font: inherit;
+  }
+  .controls label { color: var(--muted); display: inline-flex; align-items: center;
+                    gap: 6px; }
+  .summary { margin-top: 8px; color: var(--muted); font-size: 13px; }
+  .summary strong { color: var(--fg); }
+  .error { margin: 14px 24px; padding: 12px 14px; background: rgba(248,113,113,.1);
+           border: 1px solid var(--bad); color: var(--bad); border-radius: 6px; }
+  .wrap { padding: 0 24px 40px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 18px;
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 6px; overflow: hidden; }
+  thead th { position: sticky; top: 72px; background: var(--surface);
+             text-align: left; padding: 10px 12px; font-weight: 600;
+             border-bottom: 1px solid var(--border); cursor: pointer;
+             user-select: none; white-space: nowrap; }
+  thead th .arrow { color: var(--muted); margin-left: 4px; font-size: 11px; }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border);
+             vertical-align: top; }
+  tbody tr:nth-child(even) { background: rgba(255,255,255,.02); }
+  tbody tr:hover { background: rgba(110,231,183,.06); }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .domain { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px;
+           font-size: 12px; font-weight: 600; text-transform: capitalize; }
+  .badge.available { background: rgba(110,231,183,.15); color: var(--accent);
+                     border: 1px solid var(--accent); }
+  .badge.registered { background: rgba(139,147,164,.15); color: var(--muted);
+                      border: 1px solid var(--border); }
+  .badge.unknown { background: rgba(251,191,36,.15); color: var(--warn);
+                   border: 1px solid var(--warn); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Search and Rescue</h1>
+  <div class="sub">Expired-domain leads mined from YouTube video descriptions.</div>
+  <div class="controls">
+    <input id="filter" type="text" placeholder="Filter by domain, video title, status…">
+    <label><input type="checkbox" id="expired-only"> Only available</label>
+    <button id="refresh" type="button">Reload CSV</button>
+  </div>
+  <div id="summary" class="summary">Loading <code>report.csv</code>…</div>
+  <div id="error" class="error" style="display:none"></div>
+</header>
+
+<div class="wrap">
+  <table id="report">
+    <thead><tr>
+      <th data-col="views" data-type="number">Views<span class="arrow"></span></th>
+      <th data-col="video_title" data-type="string">Video<span class="arrow"></span></th>
+      <th data-col="domain" data-type="string">Domain<span class="arrow"></span></th>
+      <th data-col="status" data-type="string">Status<span class="arrow"></span></th>
+      <th data-col="price" data-type="string">Est. Price<span class="arrow"></span></th>
+      <th data-col="registrar" data-type="string">Registrar<span class="arrow"></span></th>
+      <th data-col="checked_at" data-type="string">Checked<span class="arrow"></span></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="empty" class="empty" style="display:none">No rows match your filter.</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var CSV_URL = "report.csv";
+  var state = {
+    rows: [],
+    sortCol: "views",
+    sortDir: "desc",
+    filter: "",
+    expiredOnly: false,
+  };
+
+  // --- Minimal RFC-4180-ish CSV parser: handles quoted fields, "" escapes,
+  // commas and newlines inside quotes.
+  function parseCSV(text) {
+    var rows = [], row = [], field = "", inQuotes = false;
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else { inQuotes = false; }
+        } else { field += c; }
+      } else if (c === '"') {
+        inQuotes = true;
+      } else if (c === ",") {
+        row.push(field); field = "";
+      } else if (c === "\n") {
+        row.push(field); field = "";
+        rows.push(row); row = [];
+      } else if (c === "\r") {
+        // ignore, handled by \n
+      } else {
+        field += c;
+      }
+    }
+    if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+    if (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") {
+      rows.pop();
+    }
+    return rows;
+  }
+
+  function toRecords(matrix) {
+    if (!matrix.length) return [];
+    var header = matrix[0];
+    var out = [];
+    for (var i = 1; i < matrix.length; i++) {
+      var r = matrix[i], obj = {};
+      for (var j = 0; j < header.length; j++) obj[header[j]] = r[j] || "";
+      out.push(obj);
+    }
+    return out;
+  }
+
+  function fmtNumber(n) {
+    n = Number(n) || 0;
+    return n.toLocaleString();
+  }
+
+  function badge(status) {
+    var s = (status || "unknown").toLowerCase();
+    var span = document.createElement("span");
+    span.className = "badge " + (["available","registered","unknown"].indexOf(s) >= 0 ? s : "unknown");
+    span.textContent = s;
+    return span;
+  }
+
+  function renderRow(r) {
+    var tr = document.createElement("tr");
+
+    var tdViews = document.createElement("td");
+    tdViews.className = "num";
+    tdViews.textContent = fmtNumber(r.views);
+    tr.appendChild(tdViews);
+
+    var tdVid = document.createElement("td");
+    if (r.video_url) {
+      var a = document.createElement("a");
+      a.href = r.video_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.textContent = r.video_title || r.video_url;
+      tdVid.appendChild(a);
+    } else {
+      tdVid.textContent = r.video_title || "";
+    }
+    tr.appendChild(tdVid);
+
+    var tdDom = document.createElement("td");
+    tdDom.className = "domain";
+    tdDom.textContent = r.domain || "";
+    tr.appendChild(tdDom);
+
+    var tdStatus = document.createElement("td");
+    tdStatus.appendChild(badge(r.status));
+    tr.appendChild(tdStatus);
+
+    var tdPrice = document.createElement("td");
+    tdPrice.textContent = r.price || "";
+    tr.appendChild(tdPrice);
+
+    var tdReg = document.createElement("td");
+    if (r.buy_url) {
+      var a2 = document.createElement("a");
+      a2.href = r.buy_url; a2.target = "_blank"; a2.rel = "noopener noreferrer";
+      a2.textContent = r.registrar || "Buy";
+      tdReg.appendChild(a2);
+    } else {
+      tdReg.textContent = r.registrar || "";
+    }
+    tr.appendChild(tdReg);
+
+    var tdChecked = document.createElement("td");
+    tdChecked.textContent = r.checked_at || "";
+    tr.appendChild(tdChecked);
+
+    return tr;
+  }
+
+  function applyFiltersAndSort(rows) {
+    var q = state.filter.trim().toLowerCase();
+    var filtered = rows;
+    if (state.expiredOnly) {
+      filtered = filtered.filter(function (r) { return (r.status || "").toLowerCase() === "available"; });
+    }
+    if (q) {
+      filtered = filtered.filter(function (r) {
+        return (
+          (r.domain || "").toLowerCase().indexOf(q) >= 0 ||
+          (r.video_title || "").toLowerCase().indexOf(q) >= 0 ||
+          (r.status || "").toLowerCase().indexOf(q) >= 0 ||
+          (r.registrar || "").toLowerCase().indexOf(q) >= 0 ||
+          (r.price || "").toLowerCase().indexOf(q) >= 0
+        );
+      });
+    }
+
+    var col = state.sortCol, dir = state.sortDir === "asc" ? 1 : -1;
+    var th = document.querySelector('thead th[data-col="' + col + '"]');
+    var isNum = th && th.getAttribute("data-type") === "number";
+    filtered.sort(function (a, b) {
+      var av = a[col], bv = b[col];
+      if (isNum) {
+        av = Number(av) || 0; bv = Number(bv) || 0;
+        return (av - bv) * dir;
+      }
+      av = (av || "").toString().toLowerCase();
+      bv = (bv || "").toString().toLowerCase();
+      if (av < bv) return -1 * dir;
+      if (av > bv) return  1 * dir;
+      return 0;
+    });
+    return filtered;
+  }
+
+  function renderSortArrows() {
+    document.querySelectorAll("thead th").forEach(function (th) {
+      var arrow = th.querySelector(".arrow");
+      if (!arrow) return;
+      if (th.getAttribute("data-col") === state.sortCol) {
+        arrow.textContent = state.sortDir === "asc" ? "▲" : "▼";
+      } else {
+        arrow.textContent = "";
+      }
+    });
+  }
+
+  function render() {
+    var tbody = document.querySelector("#report tbody");
+    tbody.textContent = "";
+    var filtered = applyFiltersAndSort(state.rows);
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < filtered.length; i++) frag.appendChild(renderRow(filtered[i]));
+    tbody.appendChild(frag);
+
+    var empty = document.getElementById("empty");
+    empty.style.display = filtered.length ? "none" : "block";
+
+    var total = state.rows.length;
+    var available = state.rows.filter(function (r) { return (r.status || "").toLowerCase() === "available"; }).length;
+    var latest = state.rows.reduce(function (acc, r) {
+      return r.checked_at && r.checked_at > acc ? r.checked_at : acc;
+    }, "");
+    var summary = document.getElementById("summary");
+    summary.innerHTML = "";
+    summary.appendChild(document.createTextNode(
+      "Showing " + fmtNumber(filtered.length) + " of " + fmtNumber(total) + " rows · "
+    ));
+    var strong = document.createElement("strong");
+    strong.textContent = fmtNumber(available) + " available";
+    summary.appendChild(strong);
+    summary.appendChild(document.createTextNode(
+      latest ? " · last checked " + latest : ""
+    ));
+
+    renderSortArrows();
+  }
+
+  function loadCSV() {
+    var errEl = document.getElementById("error");
+    errEl.style.display = "none";
+    var url = CSV_URL + "?t=" + Date.now();
+    fetch(url, { cache: "no-store" })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("HTTP " + resp.status + " fetching " + CSV_URL);
+        return resp.text();
+      })
+      .then(function (text) {
+        var matrix = parseCSV(text);
+        state.rows = toRecords(matrix);
+        render();
+      })
+      .catch(function (err) {
+        errEl.textContent =
+          "Could not load " + CSV_URL + ": " + err.message +
+          ". Tip: serve this folder via `python -m http.server` and open it over HTTP.";
+        errEl.style.display = "block";
+        state.rows = [];
+        render();
+      });
+  }
+
+  document.querySelectorAll("thead th").forEach(function (th) {
+    th.addEventListener("click", function () {
+      var col = th.getAttribute("data-col");
+      if (state.sortCol === col) {
+        state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        state.sortCol = col;
+        state.sortDir = th.getAttribute("data-type") === "number" ? "desc" : "asc";
+      }
+      render();
+    });
+  });
+
+  document.getElementById("filter").addEventListener("input", function (e) {
+    state.filter = e.target.value;
+    render();
+  });
+  document.getElementById("expired-only").addEventListener("change", function (e) {
+    state.expiredOnly = e.target.checked;
+    render();
+  });
+  document.getElementById("refresh").addEventListener("click", loadCSV);
+
+  loadCSV();
+})();
+</script>
+</body>
+</html>
